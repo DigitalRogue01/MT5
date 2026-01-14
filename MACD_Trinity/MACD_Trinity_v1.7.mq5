@@ -1,73 +1,69 @@
 //+------------------------------------------------------------------+
 //|                                                   MACD_TrinityEA |
-//|                 MACD Trinity: Trend + Reversal + MTF + optional AI|
+//|                    MACD-only system + optional AI confirmation    |
 //|                                                                  |
-//|  v1.7: System 2 Reversal added (MACD divergence + trigger)        |
-//|       - Trend System kept intact                                 |
-//|       - Reversal: swing divergence + MACD/hist weakening + trigger|
-//|       - MTF: always-updating HUD + gates for Trend/Reversal       |
-//|       - AI packet includes system + mtf status                    |
+//|  v1.7: SystemMode + MTF MACD confirmation + robust CopyBuffer     |
+//|        + Signal Source display (TREND vs REVERSAL)                |
+//|        - Adds SystemMode: TREND_ONLY / REVERSAL_ONLY / BOTH       |
+//|        - Adds MTF confirm (TF1/TF2) with warmup checks            |
+//|        - Fixes "all zeros" logs by enforcing BarsCalculated/Copy   |
+//|        - HUD shows MTF + last signal source/reason                |
+//|        - AI packet includes MTF + SystemMode                       |
+//|        - CSV includes signal_source, signal_note                  |
 //+------------------------------------------------------------------+
 #property strict
 
 #include <Trade/Trade.mqh>
 CTrade trade;
 
-//============================ SystemMode =============================
-enum SystemModeEnum
+//---------------------------- Enums ----------------------------------
+enum ENUM_SystemMode
 {
-   SYSTEM_TREND_ONLY    = 0,
-   SYSTEM_REVERSAL_ONLY = 1,
-   SYSTEM_BOTH          = 2
+   TREND_ONLY = 0,
+   REVERSAL_ONLY = 1,
+   BOTH = 2
 };
-input SystemModeEnum InpSystemMode = SYSTEM_BOTH;
 
-//---------------------------- MACD Inputs ----------------------------
+//---------------------------- Inputs --------------------------------
+input ENUM_SystemMode InpSystemMode        = BOTH;
+
+// MACD
 input int    InpMACD_Fast          = 12;
 input int    InpMACD_Slow          = 26;
 input int    InpMACD_Signal        = 9;
 
+// Filters / stops
 input int    InpMedianLookbackN    = 50;     // Median lookback for chop filters
 input int    InpSwingLookbackL     = 10;     // Swing lookback for stop loss
 
-input double InpZeroZoneFactor     = 0.30;   // factor * median(|MACD|)
-input double InpFlatHistFactor     = 0.15;   // factor * median(|Hist|)
+input double InpZeroZoneFactor     = 0.60;   // ZeroZone = factor * median(|MACD|)
+input double InpFlatHistFactor     = 0.15;   // flatHist if |hist| < factor * median(|hist|)
 
+// Trade control
 input bool   InpOneTradePerBar     = true;
-input int    InpCooldownBars       = 2;      // after close, wait this many bars before re-enter
+input int    InpCooldownBars       = 2;      // after close, wait bars before re-enter
 
-// Trend arming window
+// Arming window (for TREND logic)
 input int    InpArmBars            = 6;
 input bool   InpRequireSetupTurn   = true;
 
-// Option A early exit on histogram weakening (applies to all positions)
+// Option A early exit on histogram weakening
 input bool   InpExitOnHistWeakening = true;
 
-input double InpLots               = 0.10;
+// Risk/size
+input double InpLots               = 0.10;   // Fixed lot for now
 input int    InpSlippagePoints     = 20;
 
-//============================ MTF Confirmation =======================
+// ----------------- MTF Confirmation (System 3) ----------------------
 input bool            InpUseMTFConfirm = true;
-input ENUM_TIMEFRAMES InpTF_Bias       = PERIOD_H1;
-input ENUM_TIMEFRAMES InpTF_Regime     = PERIOD_H4;
+input ENUM_TIMEFRAMES InpMTF_TF1       = PERIOD_H1;
+input ENUM_TIMEFRAMES InpMTF_TF2       = PERIOD_H4;
 
-//============================ v1.7 Reversal Inputs ===================
-// Swing detection for divergence (local TF)
-input int    InpRevSwingLen            = 3;     // pivot sensitivity: 2..5 typical
-input int    InpRevMaxLookbackBars     = 120;   // how far back to search swings
+// What should MTF confirm?
+input bool InpMTF_RequireRegimeSign  = true; // BUY: macd>0, SELL: macd<0 on TF1+TF2
+input bool InpMTF_RequireMomentum    = true; // BUY: macd>signal, SELL: macd<signal on TF1+TF2
 
-// Divergence strength gates (MACD-only magnitude control)
-input double InpRevMinHistFactor       = 0.20;  // require |hist0| > factor*median(|hist|)
-
-// Reversal trigger selection (kept simple, robust)
-input bool   InpRevTrigger_HistCross0  = true;  // hist crosses 0
-input bool   InpRevTrigger_MacdCrossSig= true;  // macd crosses signal
-input bool   InpRevTrigger_MacdCross0  = true;  // macd crosses 0
-
-// MTF weakening logic for reversal (prevents fading strong HTF impulse)
-input bool   InpRevRequireHTFNotStrong = true;  // block reversal if BOTH HTFs are strongly trending
-
-//============================ AI Confirmation =========================
+// ----------------- AI Confirmation (ChatGPT/OpenAI) -----------------
 input bool   InpUseAIConfirm       = true;
 input double InpMinAIConfidence    = 0.60;
 
@@ -84,18 +80,19 @@ input string InpAI_LogFile         = "MACD_Trinity_AIlog.csv";
 input int    InpAI_ReasonMaxChars  = 140;
 
 //---------------------------- Globals --------------------------------
+// Handles
 int      g_macdHandle = INVALID_HANDLE;
-int      g_macdHandleBias   = INVALID_HANDLE;
-int      g_macdHandleRegime = INVALID_HANDLE;
+int      g_macdHandleTF1 = INVALID_HANDLE;
+int      g_macdHandleTF2 = INVALID_HANDLE;
 
 datetime g_lastBarTime = 0;
 int      g_cooldownRemaining = 0;
 
-// Trend arming state
+// arming state (TREND)
 int g_armDir  = 0;   // 0 none, 1 long armed, -1 short armed
-int g_armLeft = 0;   // bars remaining while armed
+int g_armLeft = 0;
 
-// MACD buffers (local TF)
+// MACD buffers (local)
 double g_macdMain[];
 double g_macdSignal[];
 
@@ -103,26 +100,21 @@ double g_macdSignal[];
 string g_apiKey = "";
 bool   g_useAIConfirm = false;
 
-// MTF status globals (for HUD + gating + AI packet)
-bool   g_mtfEnabled     = false;
-bool   g_mtfOK          = true;
-bool   g_mtfBiasBull    = false;
-bool   g_mtfRegimeBull  = false;
-double g_mtfBiasHist0   = 0.0;
-double g_mtfBiasHist1   = 0.0;
-double g_mtfRegHist0    = 0.0;
-double g_mtfRegHist1    = 0.0;
-string g_mtfStr         = "N/A";
-
-string g_systemName     = "TREND"; // "TREND" or "REVERSAL" (for AI packet)
-
 // AI feedback (latest)
 string   g_aiLastCandidate = "";
 string   g_aiLastDecision  = "";
 double   g_aiLastConf      = 0.0;
 string   g_aiLastReason    = "";
 bool     g_aiLastApproved  = false;
-datetime g_aiLastTime      = 0;
+datetime g_aiLastTime       = 0;
+
+// MTF status (latest)
+bool   g_mtfOK = true;
+string g_mtfReason = "N/A";
+
+// --- Signal source tracking ---
+string g_lastSignalSource = "NONE";   // TREND / REVERSAL / NONE
+string g_lastSignalNote   = "";
 
 //---------------------------- Helpers --------------------------------
 bool IsNewBar()
@@ -161,6 +153,7 @@ string CsvEscape(string s)
    return s;
 }
 
+// Median of abs(values) over [startShift .. startShift+count-1] from series[]
 double MedianAbsFromSeries(const double &series[], int startShift, int count)
 {
    if(count <= 0) return 0.0;
@@ -203,14 +196,56 @@ bool HasPositionForSymbol(const string sym, long &posType, ulong &ticket)
 {
    posType = -1;
    ticket  = 0;
-
    if(!PositionSelect(sym)) return false;
-
    posType = (long)PositionGetInteger(POSITION_TYPE);
    ticket  = (ulong)PositionGetInteger(POSITION_TICKET);
    return true;
 }
 
+// ---------------- Robust MACD Copy (fixes "zeros") ------------------
+bool CopyMACDSeries(const int handle, const int count, double &mainBuf[], double &sigBuf[])
+{
+   if(handle == INVALID_HANDLE) return false;
+
+   int calc = BarsCalculated(handle);
+   if(calc < count + 5) // warmup cushion
+      return false;
+
+   ArrayResize(mainBuf, count);
+   ArrayResize(sigBuf,  count);
+   ArraySetAsSeries(mainBuf, true);
+   ArraySetAsSeries(sigBuf,  true);
+
+   int c1 = CopyBuffer(handle, 0, 0, count, mainBuf);
+   int c2 = CopyBuffer(handle, 1, 0, count, sigBuf);
+
+   if(c1 != count || c2 != count) return false;
+   return true;
+}
+
+// Get MACD(shift) and Signal(shift) from a handle (used for MTF quick checks)
+bool GetMACDAtShift(const int handle, const int shift, double &macdOut, double &sigOut)
+{
+   macdOut = 0.0; sigOut = 0.0;
+   if(handle == INVALID_HANDLE) return false;
+
+   int calc = BarsCalculated(handle);
+   if(calc < shift + 5) return false;
+
+   double m[1], s[1];
+   ArraySetAsSeries(m, true);
+   ArraySetAsSeries(s, true);
+
+   int c1 = CopyBuffer(handle, 0, shift, 1, m);
+   int c2 = CopyBuffer(handle, 1, shift, 1, s);
+   if(c1 != 1 || c2 != 1) return false;
+
+   macdOut = m[0];
+   sigOut  = s[0];
+   return true;
+}
+
+// ---------------- AI Key loading -----------------------------------
 bool LoadApiKeyFromFile()
 {
    if(InpAI_KeyFile == "")
@@ -238,6 +273,7 @@ bool LoadApiKeyFromFile()
    return true;
 }
 
+// ---------------- AI feedback + CSV ---------------------------------
 void SaveAIFeedback(const string candidate, const string decision, const double conf, const string reason, const bool approved)
 {
    g_aiLastCandidate = candidate;
@@ -261,9 +297,14 @@ void AppendAICsv(const string candidate,
                  const string decision,
                  const double conf,
                  const bool approved,
+                 const string systemModeStr,
+                 const string signalSource,
+                 const string signalNote,
                  const string regimeStr,
                  const bool nearZero,
                  const bool flatHist,
+                 const bool mtfOK,
+                 const string mtfReason,
                  const double macd0,
                  const double sig0,
                  const double hist0,
@@ -285,7 +326,10 @@ void AppendAICsv(const string candidate,
 
    if(FileSize(h) == 0)
    {
-      FileWriteString(h, "time,symbol,tf,candidate,decision,confidence,approved,system,regime,nearZero,flatHist,macd0,sig0,hist0,mtf,reason\r\n");
+      FileWriteString(h,
+         "time,symbol,tf,system_mode,signal_source,signal_note,"
+         "candidate,decision,confidence,approved,regime,nearZero,flatHist,mtfOK,mtfReason,"
+         "macd0,sig0,hist0,reason\r\n");
    }
 
    FileSeek(h, 0, SEEK_END);
@@ -294,85 +338,26 @@ void AppendAICsv(const string candidate,
       CsvEscape(TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS)) + "," +
       CsvEscape(_Symbol) + "," +
       CsvEscape(EnumToString(_Period)) + "," +
+      CsvEscape(systemModeStr) + "," +
+      CsvEscape(signalSource) + "," +
+      CsvEscape(signalNote) + "," +
       CsvEscape(candidate) + "," +
       CsvEscape(decision) + "," +
       DoubleToString(conf, 6) + "," +
       (approved ? "1" : "0") + "," +
-      CsvEscape(g_systemName) + "," +
       CsvEscape(regimeStr) + "," +
       (nearZero ? "1" : "0") + "," +
       (flatHist ? "1" : "0") + "," +
+      (mtfOK ? "1" : "0") + "," +
+      CsvEscape(TruncReason(mtfReason, 200)) + "," +
       DoubleToString(macd0, 10) + "," +
       DoubleToString(sig0, 10) + "," +
       DoubleToString(hist0, 10) + "," +
-      CsvEscape(g_mtfStr + (g_mtfEnabled ? (g_mtfOK ? " (OK)" : " (WAIT)") : " (OFF)")) + "," +
       CsvEscape(TruncReason(reason, 500)) +
       "\r\n";
 
    FileWriteString(h, line);
    FileClose(h);
-}
-
-//--------------------- MACD read helper for any handle ---------------
-bool ReadMACD(const int handle, const int shift, double &mainOut, double &sigOut)
-{
-   if(handle == INVALID_HANDLE) return false;
-
-   double m[1], s[1];
-   int c1 = CopyBuffer(handle, 0, shift, 1, m);
-   int c2 = CopyBuffer(handle, 1, shift, 1, s);
-   if(c1 <= 0 || c2 <= 0) return false;
-
-   mainOut = m[0];
-   sigOut  = s[0];
-   return true;
-}
-
-//====================== Always Update MTF Status ======================
-bool UpdateMTFStatus()
-{
-   g_mtfOK = true;
-   g_mtfStr = "N/A";
-   g_mtfBiasBull = false;
-   g_mtfRegimeBull = false;
-   g_mtfBiasHist0 = 0.0;
-   g_mtfBiasHist1 = 0.0;
-   g_mtfRegHist0  = 0.0;
-   g_mtfRegHist1  = 0.0;
-
-   if(!g_mtfEnabled) return true;
-
-   if(g_macdHandleBias == INVALID_HANDLE || g_macdHandleRegime == INVALID_HANDLE)
-   {
-      g_mtfOK = false;
-      g_mtfStr = "MTF_HANDLE_ERR";
-      return false;
-   }
-
-   // closed bars on HTF
-   double b0m,b0s,b1m,b1s, r0m,r0s,r1m,r1s;
-   if(!ReadMACD(g_macdHandleBias,   1, b0m, b0s) ||
-      !ReadMACD(g_macdHandleBias,   2, b1m, b1s) ||
-      !ReadMACD(g_macdHandleRegime, 1, r0m, r0s) ||
-      !ReadMACD(g_macdHandleRegime, 2, r1m, r1s))
-   {
-      g_mtfOK = false;
-      g_mtfStr = "MTF_DATA_WAIT";
-      return false;
-   }
-
-   g_mtfBiasBull   = (b0m > 0.0);
-   g_mtfRegimeBull = (r0m > 0.0);
-
-   g_mtfBiasHist0  = (b0m - b0s);
-   g_mtfBiasHist1  = (b1m - b1s);
-   g_mtfRegHist0   = (r0m - r0s);
-   g_mtfRegHist1   = (r1m - r1s);
-
-   g_mtfStr = StringFormat("%s=%s(h%.5f)  %s=%s(h%.5f)",
-                           EnumToString(InpTF_Bias),   g_mtfBiasBull ? "BULL" : "BEAR", g_mtfBiasHist0,
-                           EnumToString(InpTF_Regime), g_mtfRegimeBull ? "BULL" : "BEAR", g_mtfRegHist0);
-   return true;
 }
 
 //--------------------- Minimal JSON extraction helpers ----------------
@@ -545,13 +530,85 @@ string JsonEscape(string s)
    return s;
 }
 
-//============================ AIConfirmTrade ==========================
+string SystemModeToString(ENUM_SystemMode m)
+{
+   if(m == TREND_ONLY) return "TREND_ONLY";
+   if(m == REVERSAL_ONLY) return "REVERSAL_ONLY";
+   return "BOTH";
+}
+
+// ---------------- MTF Confirmation logic ----------------------------
+bool MTFConfirm(const string candidate, string &reasonOut)
+{
+   reasonOut = "N/A";
+
+   if(!InpUseMTFConfirm)
+   {
+      reasonOut = "MTF disabled";
+      return true;
+   }
+
+   if(InpMTF_TF1 == PERIOD_CURRENT || InpMTF_TF2 == PERIOD_CURRENT)
+   {
+      reasonOut = "Invalid MTF TF (cannot be CURRENT)";
+      return false;
+   }
+
+   double m1=0,s1=0,m2=0,s2=0;
+   bool ok1 = GetMACDAtShift(g_macdHandleTF1, 1, m1, s1); // closed bar
+   bool ok2 = GetMACDAtShift(g_macdHandleTF2, 1, m2, s2);
+
+   if(!ok1 || !ok2)
+   {
+      reasonOut = "MTF warmup/CopyBuffer not ready (history not loaded yet)";
+      return false;
+   }
+
+   bool wantBuy  = (candidate == "BUY");
+   bool wantSell = (candidate == "SELL");
+
+   bool pass = true;
+   string r = "";
+
+   if(InpMTF_RequireRegimeSign)
+   {
+      bool sign1 = wantBuy ? (m1 > 0.0) : (m1 < 0.0);
+      bool sign2 = wantBuy ? (m2 > 0.0) : (m2 < 0.0);
+      if(!sign1 || !sign2)
+      {
+         pass = false;
+         r += StringFormat("RegimeSign fail: TF1 m=%.6f TF2 m=%.6f. ", m1, m2);
+      }
+   }
+
+   if(InpMTF_RequireMomentum)
+   {
+      bool mom1 = wantBuy ? (m1 > s1) : (m1 < s1);
+      bool mom2 = wantBuy ? (m2 > s2) : (m2 < s2);
+      if(!mom1 || !mom2)
+      {
+         pass = false;
+         r += StringFormat("Momentum fail: TF1 m-s=%.6f TF2 m-s=%.6f. ", (m1-s1), (m2-s2));
+      }
+   }
+
+   if(pass) r = StringFormat("OK TF1(m=%.6f s=%.6f) TF2(m=%.6f s=%.6f)", m1, s1, m2, s2);
+   reasonOut = r;
+   return pass;
+}
+
+// ---------------- AI Confirm ----------------------------------------
 bool AIConfirmTrade(const string dirCandidate,
+                    const string systemModeStr,
+                    const string signalSource,
+                    const string signalNote,
                     const string regimeStr,
                     const bool setupOk,
                     const bool triggerOk,
                     const bool nearZero,
                     const bool flatHist,
+                    const bool mtfOK,
+                    const string mtfReason,
                     const double macd0, const double macd1,
                     const double sig0,  const double sig1,
                     const double hist0, const double hist1,
@@ -569,7 +626,6 @@ bool AIConfirmTrade(const string dirCandidate,
    aiConf     = 0.0;
    aiReason   = "";
 
-   // Auto-bypass AI in Strategy Tester / Optimization
    if((bool)MQLInfoInteger(MQL_TESTER) || (bool)MQLInfoInteger(MQL_OPTIMIZATION))
    {
       aiDecision = dirCandidate;
@@ -600,19 +656,9 @@ bool AIConfirmTrade(const string dirCandidate,
       "\"symbol\":\""+_Symbol+"\","
       "\"tf\":\""+EnumToString(_Period)+"\","
       "\"time\":\""+TimeToString(iTime(_Symbol,_Period,1), TIME_DATE|TIME_MINUTES)+"\","
-      "\"system\":\""+g_systemName+"\","
-      "\"mtf\":{"
-         "\"enabled\":"+(g_mtfEnabled?"true":"false")+","
-         "\"status\":\""+(g_mtfOK?"OK":"WAIT")+"\","
-         "\"bias_tf\":\""+EnumToString(InpTF_Bias)+"\","
-         "\"regime_tf\":\""+EnumToString(InpTF_Regime)+"\","
-         "\"bias\":\""+(g_mtfBiasBull?"BULL":"BEAR")+"\","
-         "\"regime\":\""+(g_mtfRegimeBull?"BULL":"BEAR")+"\","
-         "\"bias_hist0\":"+DoubleToString(g_mtfBiasHist0,10)+","
-         "\"bias_hist1\":"+DoubleToString(g_mtfBiasHist1,10)+","
-         "\"reg_hist0\":"+DoubleToString(g_mtfRegHist0,10)+","
-         "\"reg_hist1\":"+DoubleToString(g_mtfRegHist1,10)+
-      "},"
+      "\"system_mode\":\""+systemModeStr+"\","
+      "\"signal_source\":\""+signalSource+"\","
+      "\"signal_note\":\""+JsonEscape(signalNote)+"\","
       "\"macd\":{"
          "\"main\":["+DoubleToString(macd0,10)+","+DoubleToString(macd1,10)+"],"
          "\"signal\":["+DoubleToString(sig0,10)+","+DoubleToString(sig1,10)+"],"
@@ -624,6 +670,11 @@ bool AIConfirmTrade(const string dirCandidate,
       "\"filters\":{"
          "\"near_zero\":"+(nearZero?"true":"false")+","
          "\"flat_hist\":"+(flatHist?"true":"false")+
+      "},"
+      "\"mtf\":{"
+         "\"enabled\":"+(InpUseMTFConfirm?"true":"false")+","
+         "\"ok\":"+(mtfOK?"true":"false")+","
+         "\"reason\":\""+JsonEscape(mtfReason)+"\""
       "},"
       "\"rules\":{"
          "\"regime\":\""+regimeStr+"\","
@@ -640,11 +691,11 @@ bool AIConfirmTrade(const string dirCandidate,
       "}";
 
    string systemPrompt =
-      "You confirm trades for a MACD-only system. "
-      "Use ONLY the packet data (MACD/MTF/swing levels). "
-      "If mtf.enabled is true and mtf.status is WAIT, return WAIT. "
-      "Return BUY/SELL only if system rules align AND filters_ok; otherwise WAIT. "
-      "Output ONLY valid JSON keys: decision, confidence, reason.";
+      "You confirm trades for a MACD-only system (Trend/Reversal + MTF filter). "
+      "Use ONLY the packet values. "
+      "Approve BUY/SELL only if candidate aligns with regime+setup+trigger AND mtf.ok=true. "
+      "Return WAIT otherwise. "
+      "Output ONLY valid JSON with keys: decision, confidence, reason, regime, setup, trigger, filters_ok, mtf_ok.";
 
    string userPrompt = "PACKET:\n" + packet;
 
@@ -684,8 +735,6 @@ bool AIConfirmTrade(const string dirCandidate,
                " (Add URL in Tools->Options->Expert Advisors->Allow WebRequest)");
       return false;
    }
-
-   if(InpAI_DebugPrint) Print("AIConfirm: HTTP ", code, " resp=", resp);
 
    string content = ExtractContentFromOpenAI(resp);
    if(content == "")
@@ -727,67 +776,6 @@ void DrawHUD(const string text)
    ObjectSetString(0, name, OBJPROP_TEXT, text);
 }
 
-//==================== v1.7 Swing pivot helpers =======================
-// Pivot High at bar i: High[i] greater than highs of [i-len..i-1] and [i+1..i+len]
-bool IsPivotHigh(const int i, const int len)
-{
-   double hi = iHigh(_Symbol, _Period, i);
-   for(int k=1; k<=len; k++)
-   {
-      if(iHigh(_Symbol,_Period,i-k) >= hi) return false;
-      if(iHigh(_Symbol,_Period,i+k) >  hi) return false;
-   }
-   return true;
-}
-
-bool IsPivotLow(const int i, const int len)
-{
-   double lo = iLow(_Symbol, _Period, i);
-   for(int k=1; k<=len; k++)
-   {
-      if(iLow(_Symbol,_Period,i-k) <= lo) return false;
-      if(iLow(_Symbol,_Period,i+k) <  lo) return false;
-   }
-   return true;
-}
-
-// Find two most recent pivot highs (returns true if found)
-bool FindTwoPivotHighs(const int len, const int maxLookback, int &idxRecent, int &idxPrev)
-{
-   idxRecent = -1; idxPrev = -1;
-   int start = len + 2;
-   int end   = MathMin(maxLookback, Bars(_Symbol,_Period) - len - 3);
-   for(int i=start; i<=end; i++)
-   {
-      if(IsPivotHigh(i, len))
-      {
-         if(idxRecent < 0) idxRecent = i;
-         else { idxPrev = i; break; }
-      }
-   }
-   return (idxRecent > 0 && idxPrev > 0);
-}
-
-bool FindTwoPivotLows(const int len, const int maxLookback, int &idxRecent, int &idxPrev)
-{
-   idxRecent = -1; idxPrev = -1;
-   int start = len + 2;
-   int end   = MathMin(maxLookback, Bars(_Symbol,_Period) - len - 3);
-   for(int i=start; i<=end; i++)
-   {
-      if(IsPivotLow(i, len))
-      {
-         if(idxRecent < 0) idxRecent = i;
-         else { idxPrev = i; break; }
-      }
-   }
-   return (idxRecent > 0 && idxPrev > 0);
-}
-
-// HTF strong/weak detection (hist expanding vs shrinking)
-bool HTF_Bull_Strengthening(const double h0, const double h1) { return (h1 > 0.0 && h0 > h1); }
-bool HTF_Bear_Strengthening(const double h0, const double h1) { return (h1 < 0.0 && h0 < h1); }
-
 //+------------------------------------------------------------------+
 //| Expert initialization                                            |
 //+------------------------------------------------------------------+
@@ -796,21 +784,16 @@ int OnInit()
    g_macdHandle = iMACD(_Symbol, _Period, InpMACD_Fast, InpMACD_Slow, InpMACD_Signal, PRICE_CLOSE);
    if(g_macdHandle == INVALID_HANDLE)
    {
-      Print("Failed to create MACD handle.");
+      Print("Failed to create MACD handle (local).");
       return INIT_FAILED;
    }
 
-   g_mtfEnabled = InpUseMTFConfirm;
-   if(g_mtfEnabled)
+   if(InpUseMTFConfirm)
    {
-      g_macdHandleBias   = iMACD(_Symbol, InpTF_Bias,   InpMACD_Fast, InpMACD_Slow, InpMACD_Signal, PRICE_CLOSE);
-      g_macdHandleRegime = iMACD(_Symbol, InpTF_Regime, InpMACD_Fast, InpMACD_Slow, InpMACD_Signal, PRICE_CLOSE);
-
-      if(g_macdHandleBias == INVALID_HANDLE || g_macdHandleRegime == INVALID_HANDLE)
-      {
-         Print("Failed to create MTF MACD handles (Bias/Regime).");
-         return INIT_FAILED;
-      }
+      g_macdHandleTF1 = iMACD(_Symbol, InpMTF_TF1, InpMACD_Fast, InpMACD_Slow, InpMACD_Signal, PRICE_CLOSE);
+      g_macdHandleTF2 = iMACD(_Symbol, InpMTF_TF2, InpMACD_Fast, InpMACD_Slow, InpMACD_Signal, PRICE_CLOSE);
+      if(g_macdHandleTF1 == INVALID_HANDLE || g_macdHandleTF2 == INVALID_HANDLE)
+         Print("Warning: Failed to create one or more MTF MACD handles.");
    }
 
    ArraySetAsSeries(g_macdMain, true);
@@ -832,7 +815,10 @@ int OnInit()
       }
    }
 
-   Print("MACD_TrinityEA v1.7 initialized. Symbol=", _Symbol, " TF=", EnumToString(_Period));
+   Print("MACD_TrinityEA v1.7 initialized. Symbol=", _Symbol, " TF=", EnumToString(_Period),
+         " Mode=", SystemModeToString(InpSystemMode),
+         " MTF=", (InpUseMTFConfirm ? "ON" : "OFF"));
+
    return INIT_SUCCEEDED;
 }
 
@@ -844,11 +830,11 @@ void OnDeinit(const int reason)
    if(g_macdHandle != INVALID_HANDLE)
       IndicatorRelease(g_macdHandle);
 
-   if(g_macdHandleBias != INVALID_HANDLE)
-      IndicatorRelease(g_macdHandleBias);
+   if(g_macdHandleTF1 != INVALID_HANDLE)
+      IndicatorRelease(g_macdHandleTF1);
 
-   if(g_macdHandleRegime != INVALID_HANDLE)
-      IndicatorRelease(g_macdHandleRegime);
+   if(g_macdHandleTF2 != INVALID_HANDLE)
+      IndicatorRelease(g_macdHandleTF2);
 
    ObjectDelete(0, "MACD_TrinityEA_HUD");
 }
@@ -864,30 +850,31 @@ void OnTick()
    }
 
    int bars = Bars(_Symbol, _Period);
-   if(bars < (InpMedianLookbackN + 50)) return;
-
-   // Always update MTF (HUD + gating)
-   UpdateMTFStatus();
+   if(bars < (InpMedianLookbackN + 40))
+      return;
 
    int need = InpMedianLookbackN + 30;
-   if(CopyBuffer(g_macdHandle, 0, 0, need, g_macdMain) <= 0) return;
-   if(CopyBuffer(g_macdHandle, 1, 0, need, g_macdSignal) <= 0) return;
+   if(!CopyMACDSeries(g_macdHandle, need, g_macdMain, g_macdSignal))
+      return;
 
-   // CLOSED bars (local TF)
+   // CLOSED bars
    double macd0 = g_macdMain[1];
    double macd1 = g_macdMain[2];
+   double macd2 = g_macdMain[3];
+
    double sig0  = g_macdSignal[1];
    double sig1  = g_macdSignal[2];
+   double sig2  = g_macdSignal[3];
 
    double hist0 = macd0 - sig0;
    double hist1 = macd1 - sig1;
-   double hist2 = (g_macdMain[3] - g_macdSignal[3]);
+   double hist2 = macd2 - sig2;
 
-   // Median-based filters
+   // Filters
    double medAbsMacd = MedianAbsFromSeries(g_macdMain, 1, InpMedianLookbackN);
 
    double histSeries[];
-   ArrayResize(histSeries, InpMedianLookbackN + 2);
+   ArrayResize(histSeries, InpMedianLookbackN + 5);
    ArraySetAsSeries(histSeries, true);
    for(int i=1; i<=InpMedianLookbackN; i++)
       histSeries[i] = g_macdMain[i] - g_macdSignal[i];
@@ -901,30 +888,29 @@ void OnTick()
    if(InpFlatHistFactor > 0.0 && medAbsHist > 0.0)
       flatHist = (AbsD(hist0) < (InpFlatHistFactor * medAbsHist));
 
-   bool chopTrend = (nearZero || flatHist);
+   bool chop = (nearZero || flatHist);
 
-   // Regime (local TF)
+   // Regime
    bool regimeBull = (macd0 > 0.0);
    bool regimeBear = (macd0 < 0.0);
    string regimeStr = regimeBull ? "BULL" : (regimeBear ? "BEAR" : "NEUTRAL");
 
-   // Trend setup + trigger
+   // Trend logic
    bool setupBull = regimeBull && (hist0 > hist1);
    bool setupBear = regimeBear && (hist0 < hist1);
 
    bool trigBuy  = (macd1 <= sig1) && (macd0 > sig0);
    bool trigSell = (macd1 >= sig1) && (macd0 < sig0);
 
-   // Position status
+   // Position
    long posType;
    ulong ticket;
    bool hasPos = HasPositionForSymbol(_Symbol, posType, ticket);
 
-   // Cooldown decrement only while flat
    if(g_cooldownRemaining > 0 && !hasPos)
       g_cooldownRemaining--;
 
-   // Trend arming only while flat
+   // Arm (TREND)
    if(!hasPos)
    {
       if(g_armLeft > 0) g_armLeft--;
@@ -942,17 +928,27 @@ void OnTick()
       }
    }
 
-   // HUD text
-   string sysModeStr = (InpSystemMode==SYSTEM_TREND_ONLY ? "TREND_ONLY" :
-                        InpSystemMode==SYSTEM_REVERSAL_ONLY ? "REVERSAL_ONLY" : "BOTH");
+   // Reversal logic (MACD-only)
+   bool revBuySetup  = ( (macd0 < 0.0) || nearZero ) && (hist0 > hist1);
+   bool revSellSetup = ( (macd0 > 0.0) || nearZero ) && (hist0 < hist1);
+
+   bool revBuyTrig   = trigBuy;
+   bool revSellTrig  = trigSell;
+
+   bool revChopBlock = flatHist; // allow nearZero for reversal, block only flat hist
+
+   // MTF
+   string mtfReason;
+   bool mtfBuyOK  = MTFConfirm("BUY", mtfReason);
+   bool mtfSellOK = MTFConfirm("SELL", mtfReason);
+
+   // HUD lines
+   string modeStr = SystemModeToString(InpSystemMode);
 
    string posStr = "NONE";
    if(hasPos) posStr = (posType==POSITION_TYPE_BUY ? "LONG" : "SHORT");
-   string armStr = (g_armDir==1 ? "LONG" : (g_armDir==-1 ? "SHORT" : "NONE"));
 
-   string mtfLine = "MTF: OFF";
-   if(g_mtfEnabled)
-      mtfLine = "MTF: " + g_mtfStr + " (" + (g_mtfOK ? "OK" : "WAIT") + ")";
+   string armStr = (g_armDir==1 ? "LONG" : (g_armDir==-1 ? "SHORT" : "NONE"));
 
    string aiLine = "AI: OFF";
    if(g_useAIConfirm)
@@ -964,40 +960,50 @@ void OnTick()
                             (g_aiLastApproved ? "APPROVED" : "BLOCKED"));
    }
 
+   string mtfLine = "MTF: OFF";
+   if(InpUseMTFConfirm)
+      mtfLine = StringFormat("MTF: TF1=%s TF2=%s | BUY=%s SELL=%s",
+                             EnumToString(InpMTF_TF1), EnumToString(InpMTF_TF2),
+                             (mtfBuyOK?"OK":"FAIL"),
+                             (mtfSellOK?"OK":"FAIL"));
+
    string hud = StringFormat(
       "MACD Trinity EA (v1.7)\n"
       "Mode: %s\n"
-      "%s\n"
+      "LastSignal: %s | %s\n"
       "Regime: %s\n"
       "MACD0: %.8f  SIG0: %.8f\n"
       "HIST0: %.8f  HIST1: %.8f\n"
       "ZeroZone: %.8f  |MACD|: %.8f  NearZero=%s\n"
-      "FlatHist=%s  ChopTrend=%s\n"
-      "Setup(B/S): %s/%s\n"
-      "Trig(B/S): %s/%s\n"
-      "ARM: %s (%d)\n"
+      "FlatHist=%s  Chop(TREND)=%s\n"
+      "TREND Setup(B/S): %s/%s  Trig(B/S): %s/%s  ARM: %s (%d)\n"
+      "REV Setup(B/S): %s/%s  Trig(B/S): %s/%s\n"
       "Cooldown: %d\n"
+      "%s\n"
       "%s\n"
       "AI Reason: %s\n"
       "Pos: %s",
-      sysModeStr,
-      mtfLine,
+      modeStr,
+      g_lastSignalSource, g_lastSignalNote,
       regimeStr,
       macd0, sig0,
       hist0, hist1,
       zeroZone, AbsD(macd0), (nearZero?"Y":"N"),
-      (flatHist?"Y":"N"), (chopTrend?"Y":"N"),
+      (flatHist?"Y":"N"), (chop?"Y":"N"),
       (setupBull?"Y":"N"), (setupBear?"Y":"N"),
       (trigBuy?"Y":"N"), (trigSell?"Y":"N"),
       armStr, g_armLeft,
+      (revBuySetup?"Y":"N"), (revSellSetup?"Y":"N"),
+      (revBuyTrig?"Y":"N"), (revSellTrig?"Y":"N"),
       g_cooldownRemaining,
+      mtfLine,
       aiLine,
       TruncReason(g_aiLastReason, InpAI_ReasonMaxChars),
       posStr
    );
    DrawHUD(hud);
 
-   // ------------------- Exits (unchanged; applies to any position) -------------------
+   // ------------------- Exits -------------------
    if(hasPos)
    {
       if(posType == POSITION_TYPE_BUY)
@@ -1065,265 +1071,133 @@ void OnTick()
       return;
    }
 
-   // ------------------- Flat gates -------------------
+   // ------------------- Entries -------------------
    if(g_cooldownRemaining > 0) return;
 
-   // =================== SYSTEM 1: TREND ENTRIES =====================
-   bool allowTrend = (InpSystemMode == SYSTEM_TREND_ONLY || InpSystemMode == SYSTEM_BOTH);
+   string candidate = "";
+   bool setupOk=false, triggerOk=false;
 
-   bool longCandidate  = allowTrend && (g_armDir == 1 && trigBuy);
-   bool shortCandidate = allowTrend && (g_armDir == -1 && trigSell);
+   // reset signal info each bar
+   g_lastSignalSource = "NONE";
+   g_lastSignalNote   = "";
 
-   // Trend requires NOT chop
-   if(chopTrend)
+   // TREND candidate
+   bool trendLongCandidate  = (g_armDir == 1 && trigBuy);
+   bool trendShortCandidate = (g_armDir == -1 && trigSell);
+
+   // REV candidate
+   bool revLongCandidate  = (revBuySetup && revBuyTrig);
+   bool revShortCandidate = (revSellSetup && revSellTrig);
+
+   // TREND selection (blocks chop)
+   if(InpSystemMode == TREND_ONLY || InpSystemMode == BOTH)
    {
-      longCandidate  = false;
-      shortCandidate = false;
-   }
-
-   // Trend MTF alignment gate
-   bool mtfAlignOK = true;
-   if(g_mtfEnabled && (longCandidate || shortCandidate))
-   {
-      if(!g_mtfOK) mtfAlignOK = false;
-      else
+      if(!chop)
       {
-         if(longCandidate)  mtfAlignOK = (g_mtfBiasBull && g_mtfRegimeBull);
-         if(shortCandidate) mtfAlignOK = (!g_mtfBiasBull && !g_mtfRegimeBull);
+         if(trendLongCandidate)
+         {
+            candidate="BUY"; setupOk=true; triggerOk=true;
+            g_lastSignalSource="TREND";
+            g_lastSignalNote="armed+cross (trend)";
+         }
+         else if(trendShortCandidate)
+         {
+            candidate="SELL"; setupOk=true; triggerOk=true;
+            g_lastSignalSource="TREND";
+            g_lastSignalNote="armed+cross (trend)";
+         }
       }
    }
+
+   // REVERSAL selection (allows nearZero; blocks only flat hist)
+   if(candidate=="" && (InpSystemMode == REVERSAL_ONLY || InpSystemMode == BOTH))
+   {
+      if(!revChopBlock)
+      {
+         if(revLongCandidate)
+         {
+            candidate="BUY"; setupOk=true; triggerOk=true;
+            g_lastSignalSource="REVERSAL";
+            g_lastSignalNote=(nearZero ? "nearZero+turn+cross" : "turn+cross");
+         }
+         else if(revShortCandidate)
+         {
+            candidate="SELL"; setupOk=true; triggerOk=true;
+            g_lastSignalSource="REVERSAL";
+            g_lastSignalNote=(nearZero ? "nearZero+turn+cross" : "turn+cross");
+         }
+      }
+   }
+
+   if(candidate=="") return;
+
+   // clear arm once candidate forms
+   g_armDir = 0; g_armLeft = 0;
+
+   // MTF per candidate
+   bool mtfOK = true;
+   string mtfR = "MTF disabled";
+   if(InpUseMTFConfirm)
+   {
+      mtfOK = (candidate=="BUY") ? mtfBuyOK : mtfSellOK;
+      mtfR  = mtfReason;
+   }
+   g_mtfOK = mtfOK;
+   g_mtfReason = mtfR;
+
+   if(!mtfOK)
+      return;
 
    double closePrice = iClose(_Symbol, _Period, 1);
    double swingLow   = LowestLow(InpSwingLookbackL);
    double swingHigh  = HighestHigh(InpSwingLookbackL);
 
-   if(g_mtfEnabled && (longCandidate || shortCandidate) && !mtfAlignOK)
+   string modeStr2 = SystemModeToString(InpSystemMode);
+
+   // AI confirm
+   string aiDecision, aiReason;
+   double aiConf;
+
+   bool okAI = AIConfirmTrade(candidate, modeStr2, g_lastSignalSource, g_lastSignalNote,
+                              regimeStr, setupOk, triggerOk, nearZero, flatHist,
+                              mtfOK, mtfR,
+                              macd0, macd1, sig0, sig1, hist0, hist1,
+                              zeroZone, medAbsMacd, medAbsHist,
+                              closePrice, swingLow, swingHigh,
+                              aiDecision, aiConf, aiReason);
+
+   bool approved = (!g_useAIConfirm || okAI);
+
+   SaveAIFeedback(candidate, aiDecision, aiConf, aiReason, approved);
+   AppendAICsv(candidate, aiDecision, aiConf, approved, modeStr2, g_lastSignalSource, g_lastSignalNote,
+               regimeStr, nearZero, flatHist, mtfOK, mtfR,
+               macd0, sig0, hist0, aiReason);
+
+   if(!approved) return;
+
+   // Print entry source to Experts
+   Print("ENTRY: ", candidate,
+         " source=", g_lastSignalSource,
+         " note=", g_lastSignalNote,
+         " mtfOK=", (mtfOK?"Y":"N"),
+         " nearZero=", (nearZero?"Y":"N"),
+         " flatHist=", (flatHist?"Y":"N"));
+
+   // Place trade
+   if(candidate=="BUY")
    {
-      g_systemName = "TREND";
-      string cand = longCandidate ? "BUY" : "SELL";
-      string why  = (g_mtfOK ? "MTF confirmation failed (" + g_mtfStr + ")" : "MTF not ready (" + g_mtfStr + ")");
-
-      SaveAIFeedback(cand, "WAIT", 0.0, why, false);
-      AppendAICsv(cand, "WAIT", 0.0, false, regimeStr, nearZero, flatHist, macd0, sig0, hist0, why);
-
-      g_armDir = 0; g_armLeft = 0;
-      return;
-   }
-
-   // Trend BUY
-   if(longCandidate)
-   {
-      g_systemName = "TREND";
-      g_armDir = 0; g_armLeft = 0;
-
-      string aiDecision, aiReason;
-      double aiConf;
-
-      bool okAI = AIConfirmTrade("BUY", regimeStr, true, true, nearZero, flatHist,
-                                 macd0, macd1, sig0, sig1, hist0, hist1,
-                                 zeroZone, medAbsMacd, medAbsHist,
-                                 closePrice, swingLow, swingHigh,
-                                 aiDecision, aiConf, aiReason);
-
-      bool approved = (!g_useAIConfirm || okAI);
-      SaveAIFeedback("BUY", aiDecision, aiConf, aiReason, approved);
-      AppendAICsv("BUY", aiDecision, aiConf, approved, regimeStr, nearZero, flatHist, macd0, sig0, hist0, aiReason);
-
-      if(approved)
-      {
-         double sl = swingLow;
-         if(sl > 0.0 && sl < closePrice)
-            trade.Buy(InpLots, _Symbol, 0.0, sl, 0.0, "MACD Trinity TREND BUY");
-      }
-      return;
-   }
-
-   // Trend SELL
-   if(shortCandidate)
-   {
-      g_systemName = "TREND";
-      g_armDir = 0; g_armLeft = 0;
-
-      string aiDecision, aiReason;
-      double aiConf;
-
-      bool okAI = AIConfirmTrade("SELL", regimeStr, true, true, nearZero, flatHist,
-                                 macd0, macd1, sig0, sig1, hist0, hist1,
-                                 zeroZone, medAbsMacd, medAbsHist,
-                                 closePrice, swingLow, swingHigh,
-                                 aiDecision, aiConf, aiReason);
-
-      bool approved = (!g_useAIConfirm || okAI);
-      SaveAIFeedback("SELL", aiDecision, aiConf, aiReason, approved);
-      AppendAICsv("SELL", aiDecision, aiConf, approved, regimeStr, nearZero, flatHist, macd0, sig0, hist0, aiReason);
-
-      if(approved)
-      {
-         double sl = swingHigh;
-         if(sl > 0.0 && sl > closePrice)
-            trade.Sell(InpLots, _Symbol, 0.0, sl, 0.0, "MACD Trinity TREND SELL");
-      }
-      return;
-   }
-
-   // =================== SYSTEM 2: REVERSAL ENTRIES ==================
-   bool allowRev = (InpSystemMode == SYSTEM_REVERSAL_ONLY || InpSystemMode == SYSTEM_BOTH);
-   if(!allowRev) return;
-
-   // Reversal should NOT fire on completely dead hist
-   bool revHistOk = true;
-   if(InpRevMinHistFactor > 0.0 && medAbsHist > 0.0)
-      revHistOk = (AbsD(hist0) >= (InpRevMinHistFactor * medAbsHist));
-   if(!revHistOk) return;
-
-   // HTF "Not Strong" gate: block reversal if BOTH HTFs are strongly trending in same direction
-   if(g_mtfEnabled && InpRevRequireHTFNotStrong)
-   {
-      if(!g_mtfOK)
-         return;
-
-      bool biasStrongBull = (g_mtfBiasBull   && HTF_Bull_Strengthening(g_mtfBiasHist0, g_mtfBiasHist1));
-      bool regStrongBull  = (g_mtfRegimeBull && HTF_Bull_Strengthening(g_mtfRegHist0,  g_mtfRegHist1));
-      bool biasStrongBear = (!g_mtfBiasBull  && HTF_Bear_Strengthening(g_mtfBiasHist0, g_mtfBiasHist1));
-      bool regStrongBear  = (!g_mtfRegimeBull&& HTF_Bear_Strengthening(g_mtfRegHist0,  g_mtfRegHist1));
-
-      // If both HTFs strongly bullish, don't SELL reversal
-      // If both HTFs strongly bearish, don't BUY reversal
-      // We'll enforce per-direction below.
-      // (No return here)
-   }
-
-   // Detect divergence using last two pivots (local TF)
-   int hi1, hi2, lo1, lo2;
-   bool haveHighs = FindTwoPivotHighs(InpRevSwingLen, InpRevMaxLookbackBars, hi1, hi2);
-   bool haveLows  = FindTwoPivotLows (InpRevSwingLen, InpRevMaxLookbackBars, lo1, lo2);
-
-   // Build hist at pivot bars (use macd buffers already copied)
-   auto HistAt = [&](int shift)->double { return (g_macdMain[shift] - g_macdSignal[shift]); };
-
-   // Bearish divergence (SELL reversal): price higher high, hist lower high
-   bool bearDiv = false;
-   if(haveHighs)
-   {
-      double ph1 = iHigh(_Symbol,_Period,hi1);
-      double ph2 = iHigh(_Symbol,_Period,hi2);
-      double hh1 = HistAt(hi1);
-      double hh2 = HistAt(hi2);
-      bearDiv = (ph1 > ph2) && (hh1 < hh2);
-   }
-
-   // Bullish divergence (BUY reversal): price lower low, hist higher low
-   bool bullDiv = false;
-   if(haveLows)
-   {
-      double pl1 = iLow(_Symbol,_Period,lo1);
-      double pl2 = iLow(_Symbol,_Period,lo2);
-      double hl1 = HistAt(lo1);
-      double hl2 = HistAt(lo2);
-      bullDiv = (pl1 < pl2) && (hl1 > hl2);
-   }
-
-   // Reversal setup (momentum exhaustion)
-   bool setupRevSell = (macd0 > 0.0) && (hist0 < hist1) && bearDiv;
-   bool setupRevBuy  = (macd0 < 0.0) && (hist0 > hist1) && bullDiv;
-
-   // Reversal trigger (one of enabled triggers)
-   bool trigRevSell = false;
-   bool trigRevBuy  = false;
-
-   if(InpRevTrigger_HistCross0)
-   {
-      trigRevSell |= (hist1 >= 0.0 && hist0 < 0.0);
-      trigRevBuy  |= (hist1 <= 0.0 && hist0 > 0.0);
-   }
-   if(InpRevTrigger_MacdCrossSig)
-   {
-      trigRevSell |= (macd1 >= sig1 && macd0 < sig0);
-      trigRevBuy  |= (macd1 <= sig1 && macd0 > sig0);
-   }
-   if(InpRevTrigger_MacdCross0)
-   {
-      trigRevSell |= (macd1 >= 0.0 && macd0 < 0.0);
-      trigRevBuy  |= (macd1 <= 0.0 && macd0 > 0.0);
-   }
-
-   // Directional HTF "Not Strong" enforcement
-   if(g_mtfEnabled && InpRevRequireHTFNotStrong && g_mtfOK)
-   {
-      bool biasStrongBull = (g_mtfBiasBull   && HTF_Bull_Strengthening(g_mtfBiasHist0, g_mtfBiasHist1));
-      bool regStrongBull  = (g_mtfRegimeBull && HTF_Bull_Strengthening(g_mtfRegHist0,  g_mtfRegHist1));
-      bool biasStrongBear = (!g_mtfBiasBull  && HTF_Bear_Strengthening(g_mtfBiasHist0, g_mtfBiasHist1));
-      bool regStrongBear  = (!g_mtfRegimeBull&& HTF_Bear_Strengthening(g_mtfRegHist0,  g_mtfRegHist1));
-
-      if(setupRevSell && trigRevSell)
-      {
-         if(biasStrongBull && regStrongBull) { setupRevSell=false; trigRevSell=false; }
-      }
-      if(setupRevBuy && trigRevBuy)
-      {
-         if(biasStrongBear && regStrongBear) { setupRevBuy=false; trigRevBuy=false; }
-      }
-   }
-
-   // Execute Reversal SELL
-   if(setupRevSell && trigRevSell)
-   {
-      g_systemName = "REVERSAL";
-
-      // stop above swing high
-      double sl = swingHigh;
-      if(sl <= 0.0 || sl <= closePrice) sl = HighestHigh(InpSwingLookbackL);
-
-      string aiDecision, aiReason;
-      double aiConf;
-
-      bool okAI = AIConfirmTrade("SELL", regimeStr, true, true, nearZero, flatHist,
-                                 macd0, macd1, sig0, sig1, hist0, hist1,
-                                 zeroZone, medAbsMacd, medAbsHist,
-                                 closePrice, swingLow, swingHigh,
-                                 aiDecision, aiConf, aiReason);
-
-      bool approved = (!g_useAIConfirm || okAI);
-      SaveAIFeedback("SELL", aiDecision, aiConf, aiReason, approved);
-      AppendAICsv("SELL", aiDecision, aiConf, approved, regimeStr, nearZero, flatHist, macd0, sig0, hist0,
-                  "REV: " + aiReason);
-
-      if(approved)
-      {
-         if(sl > closePrice)
-            trade.Sell(InpLots, _Symbol, 0.0, sl, 0.0, "MACD Trinity REV SELL");
-      }
-      return;
-   }
-
-   // Execute Reversal BUY
-   if(setupRevBuy && trigRevBuy)
-   {
-      g_systemName = "REVERSAL";
-
-      // stop below swing low
       double sl = swingLow;
-      if(sl <= 0.0 || sl >= closePrice) sl = LowestLow(InpSwingLookbackL);
-
-      string aiDecision, aiReason;
-      double aiConf;
-
-      bool okAI = AIConfirmTrade("BUY", regimeStr, true, true, nearZero, flatHist,
-                                 macd0, macd1, sig0, sig1, hist0, hist1,
-                                 zeroZone, medAbsMacd, medAbsHist,
-                                 closePrice, swingLow, swingHigh,
-                                 aiDecision, aiConf, aiReason);
-
-      bool approved = (!g_useAIConfirm || okAI);
-      SaveAIFeedback("BUY", aiDecision, aiConf, aiReason, approved);
-      AppendAICsv("BUY", aiDecision, aiConf, approved, regimeStr, nearZero, flatHist, macd0, sig0, hist0,
-                  "REV: " + aiReason);
-
-      if(approved)
-      {
-         if(sl < closePrice)
-            trade.Buy(InpLots, _Symbol, 0.0, sl, 0.0, "MACD Trinity REV BUY");
-      }
+      if(sl > 0.0 && sl < closePrice)
+         trade.Buy(InpLots, _Symbol, 0.0, sl, 0.0, "MACD Trinity BUY");
+      return;
+   }
+   else if(candidate=="SELL")
+   {
+      double sl = swingHigh;
+      if(sl > 0.0 && sl > closePrice)
+         trade.Sell(InpLots, _Symbol, 0.0, sl, 0.0, "MACD Trinity SELL");
       return;
    }
 }
+//+------------------------------------------------------------------+
+
