@@ -1,0 +1,5 @@
+*.ex5
+*.log
+*.tmp
+*.cache
+*.local-backup-*.mq5
