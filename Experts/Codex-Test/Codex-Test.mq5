@@ -3,7 +3,7 @@
 //| Tester-only PDH/PDL breakout EA                                  |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.20"
+#property version   "1.30"
 #property description "Loads the Previous Day High/Low indicator, marks PDH/PDL breakout signals, and can place tester-only trades."
 
 #include <Trade/Trade.mqh>
@@ -19,6 +19,9 @@ input double FixedLotSize             = 0.10;
 input int    ATRPeriod                = 14;
 input double ATRStopMultiplier        = 1.0;
 input double ATRTargetMultiplier      = 1.5;
+input bool   EnableProfitProtection   = true;
+input double BreakEvenTriggerATR      = 1.0;
+input double BreakEvenOffsetATR       = 0.10;
 input ulong  MagicNumber              = 260311;
 input bool   DrawSignalMarkers        = true;
 
@@ -108,6 +111,7 @@ void OnTick()
       return;
 
    g_last_atr_value = GetATRValue();
+   ManageOpenPosition();
 
    const double buffer = BreakBufferPoints * _Point;
    const int pdh_state = RelationToLevel(bid, pdh, buffer);
@@ -227,6 +231,53 @@ void EvaluateSignalBar(const double pdh, const double pdl, const double buffer)
 bool CanTradeInTester()
 {
    return(EnableTesterTrades && MQLInfoInteger(MQL_TESTER) != 0);
+}
+
+void ManageOpenPosition()
+{
+   if(!EnableProfitProtection || !CanTradeInTester())
+      return;
+
+   if(!PositionSelect(_Symbol))
+      return;
+
+   double atr = GetATRValue();
+   if(atr <= 0.0)
+      return;
+
+   ENUM_POSITION_TYPE position_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+   double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+   double current_sl = PositionGetDouble(POSITION_SL);
+   double current_tp = PositionGetDouble(POSITION_TP);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double trigger_distance = atr * BreakEvenTriggerATR;
+   double offset_distance = atr * BreakEvenOffsetATR;
+
+   if(position_type == POSITION_TYPE_BUY)
+   {
+      if(bid < open_price + trigger_distance)
+         return;
+
+      double protected_sl = NormalizeDouble(open_price + offset_distance, _Digits);
+      if(current_sl >= protected_sl)
+         return;
+
+      if(!trade.PositionModify(_Symbol, protected_sl, current_tp))
+         PrintFormat("Codex-Test: failed to protect BUY trade. Error=%d", GetLastError());
+   }
+   else if(position_type == POSITION_TYPE_SELL)
+   {
+      if(ask > open_price - trigger_distance)
+         return;
+
+      double protected_sl = NormalizeDouble(open_price - offset_distance, _Digits);
+      if(current_sl > 0.0 && current_sl <= protected_sl)
+         return;
+
+      if(!trade.PositionModify(_Symbol, protected_sl, current_tp))
+         PrintFormat("Codex-Test: failed to protect SELL trade. Error=%d", GetLastError());
+   }
 }
 
 void ExecuteTrade(const ENUM_ORDER_TYPE order_type)
