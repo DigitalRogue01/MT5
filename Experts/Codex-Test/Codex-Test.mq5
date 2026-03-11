@@ -3,7 +3,7 @@
 //| Tester-only PDH/PDL breakout EA                                  |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.10"
+#property version   "1.20"
 #property description "Loads the Previous Day High/Low indicator, marks PDH/PDL breakout signals, and can place tester-only trades."
 
 #include <Trade/Trade.mqh>
@@ -16,7 +16,9 @@ input bool   AlertOnNewBarOnly        = true;
 input double BreakBufferPoints        = 5.0;
 input bool   EnableTesterTrades       = true;
 input double FixedLotSize             = 0.10;
-input double RiskRewardRatio          = 1.50;
+input int    ATRPeriod                = 14;
+input double ATRStopMultiplier        = 1.0;
+input double ATRTargetMultiplier      = 1.5;
 input ulong  MagicNumber              = 260311;
 input bool   DrawSignalMarkers        = true;
 
@@ -30,6 +32,7 @@ string WOPEN_Line = "WOPEN_LINE";
 string SignalPrefix = "CODEX_SIGNAL_";
 
 int      g_indicator_handle = INVALID_HANDLE;
+int      g_atr_handle       = INVALID_HANDLE;
 datetime g_last_bar_time    = 0;
 int      g_last_pdh_state   = 0;
 int      g_last_pdl_state   = 0;
@@ -38,6 +41,7 @@ datetime g_last_signal_bar  = 0;
 int      g_buy_signals      = 0;
 int      g_sell_signals     = 0;
 int      g_trade_count      = 0;
+double   g_last_atr_value   = 0.0;
 
 CTrade trade;
 
@@ -47,6 +51,13 @@ int OnInit()
    if(g_indicator_handle == INVALID_HANDLE)
    {
       PrintFormat("Codex-Test: failed to load indicator '%s'. Error=%d", IndicatorName, GetLastError());
+      return(INIT_FAILED);
+   }
+
+   g_atr_handle = iATR(_Symbol, PERIOD_CURRENT, ATRPeriod);
+   if(g_atr_handle == INVALID_HANDLE)
+   {
+      PrintFormat("Codex-Test: failed to create ATR handle. Error=%d", GetLastError());
       return(INIT_FAILED);
    }
 
@@ -65,6 +76,9 @@ void OnDeinit(const int reason)
 
    if(g_indicator_handle != INVALID_HANDLE)
       IndicatorRelease(g_indicator_handle);
+
+   if(g_atr_handle != INVALID_HANDLE)
+      IndicatorRelease(g_atr_handle);
 }
 
 void OnTick()
@@ -92,6 +106,8 @@ void OnTick()
    const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    if(bid <= 0.0)
       return;
+
+   g_last_atr_value = GetATRValue();
 
    const double buffer = BreakBufferPoints * _Point;
    const int pdh_state = RelationToLevel(bid, pdh, buffer);
@@ -125,6 +141,18 @@ double GetLinePrice(const string name)
       return(0.0);
 
    return(ObjectGetDouble(0, name, OBJPROP_PRICE));
+}
+
+double GetATRValue()
+{
+   if(g_atr_handle == INVALID_HANDLE)
+      return(0.0);
+
+   double atr_buffer[];
+   if(CopyBuffer(g_atr_handle, 0, 1, 1, atr_buffer) < 1)
+      return(0.0);
+
+   return(atr_buffer[0]);
 }
 
 int RelationToLevel(const double price, const double level, const double buffer)
@@ -182,7 +210,7 @@ void EvaluateSignalBar(const double pdh, const double pdl, const double buffer)
       FireAlert(StringFormat("BUY signal on %s %s. Bar close %.5f broke PDH %.5f",
                              _Symbol, EnumToString(_Period), close1, pdh));
       if(CanTradeInTester())
-         ExecuteTrade(ORDER_TYPE_BUY, pdh, pdl);
+         ExecuteTrade(ORDER_TYPE_BUY);
    }
 
    if(sell_break)
@@ -192,7 +220,7 @@ void EvaluateSignalBar(const double pdh, const double pdl, const double buffer)
       FireAlert(StringFormat("SELL signal on %s %s. Bar close %.5f broke PDL %.5f",
                              _Symbol, EnumToString(_Period), close1, pdl));
       if(CanTradeInTester())
-         ExecuteTrade(ORDER_TYPE_SELL, pdh, pdl);
+         ExecuteTrade(ORDER_TYPE_SELL);
    }
 }
 
@@ -201,12 +229,22 @@ bool CanTradeInTester()
    return(EnableTesterTrades && MQLInfoInteger(MQL_TESTER) != 0);
 }
 
-void ExecuteTrade(const ENUM_ORDER_TYPE order_type,
-                  const double pdh,
-                  const double pdl)
+void ExecuteTrade(const ENUM_ORDER_TYPE order_type)
 {
    MqlTick tick;
    if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   double atr = GetATRValue();
+   if(atr <= 0.0)
+   {
+      Print("Codex-Test: skipped trade because ATR is unavailable.");
+      return;
+   }
+
+   const double stop_distance = atr * ATRStopMultiplier;
+   const double target_distance = atr * ATRTargetMultiplier;
+   if(stop_distance <= 0.0 || target_distance <= 0.0)
       return;
 
    if(PositionSelect(_Symbol))
@@ -229,13 +267,13 @@ void ExecuteTrade(const ENUM_ORDER_TYPE order_type,
 
    if(order_type == ORDER_TYPE_BUY)
    {
-      sl = NormalizeDouble(pdl, _Digits);
-      if(sl <= 0.0 || sl >= entry)
+      sl = NormalizeDouble(entry - stop_distance, _Digits);
+      tp = NormalizeDouble(entry + target_distance, _Digits);
+      if(sl <= 0.0 || sl >= entry || tp <= entry)
       {
-         Print("Codex-Test: skipped BUY trade because stop loss is invalid.");
+         Print("Codex-Test: skipped BUY trade because ATR levels are invalid.");
          return;
       }
-      tp = NormalizeDouble(entry + ((entry - sl) * RiskRewardRatio), _Digits);
       if(trade.Buy(FixedLotSize, _Symbol, 0.0, sl, tp, "Codex-Test BUY"))
          g_trade_count++;
       else
@@ -243,13 +281,13 @@ void ExecuteTrade(const ENUM_ORDER_TYPE order_type,
    }
    else if(order_type == ORDER_TYPE_SELL)
    {
-      sl = NormalizeDouble(pdh, _Digits);
-      if(sl <= entry)
+      sl = NormalizeDouble(entry + stop_distance, _Digits);
+      tp = NormalizeDouble(entry - target_distance, _Digits);
+      if(sl <= entry || tp >= entry || tp <= 0.0)
       {
-         Print("Codex-Test: skipped SELL trade because stop loss is invalid.");
+         Print("Codex-Test: skipped SELL trade because ATR levels are invalid.");
          return;
       }
-      tp = NormalizeDouble(entry - ((sl - entry) * RiskRewardRatio), _Digits);
       if(trade.Sell(FixedLotSize, _Symbol, 0.0, sl, tp, "Codex-Test SELL"))
          g_trade_count++;
       else
@@ -330,6 +368,7 @@ void ShowStatus(const double bid,
    status += StringFormat("Symbol: %s  TF: %s\n", _Symbol, EnumToString(_Period));
    status += StringFormat("Bid: %.5f\n", bid);
    status += StringFormat("PDH: %.5f  PDL: %.5f\n", pdh, pdl);
+   status += StringFormat("ATR(%d): %.5f\n", ATRPeriod, g_last_atr_value);
 
    if(mid > 0.0)
       status += StringFormat("Mid: %.5f\n", mid);
