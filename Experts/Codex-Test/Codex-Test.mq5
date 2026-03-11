@@ -3,10 +3,11 @@
 //| Tester-only PDH/PDL breakout EA                                  |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.30"
-#property description "Loads the Previous Day High/Low indicator, marks PDH/PDL breakout signals, and can place tester-only trades."
+#property version   "1.40"
+#property description "Loads the Previous Day High/Low indicator, detects compression, and places tester-only trades on confirmed breakout or sweep setups."
 
 #include <Trade/Trade.mqh>
+#include <DigitalRogue/CompressionDetector.mqh>
 
 input string IndicatorName            = "DigitalRogue\\Previouse Day High and Low";
 input bool   AttachIndicatorToChart   = true;
@@ -22,6 +23,11 @@ input double ATRTargetMultiplier      = 1.5;
 input bool   EnableProfitProtection   = true;
 input double BreakEvenTriggerATR      = 1.0;
 input double BreakEvenOffsetATR       = 0.10;
+input int    CompressionLookbackBars  = 4;
+input double CompressionToleranceATR  = 0.20;
+input double CompressionRangeATR      = 1.25;
+input double CompressionBodyATR       = 0.50;
+input int    CompressionExpiryBars    = 3;
 input ulong  MagicNumber              = 260311;
 input bool   DrawSignalMarkers        = true;
 
@@ -45,6 +51,7 @@ int      g_buy_signals      = 0;
 int      g_sell_signals     = 0;
 int      g_trade_count      = 0;
 double   g_last_atr_value   = 0.0;
+CompressionState g_compression_state;
 
 CTrade trade;
 
@@ -67,6 +74,7 @@ int OnInit()
    if(AttachIndicatorToChart && !ChartIndicatorAdd(0, 0, g_indicator_handle))
       PrintFormat("Codex-Test: indicator loaded but ChartIndicatorAdd failed. Error=%d", GetLastError());
 
+   ResetCompressionState(g_compression_state);
    trade.SetExpertMagicNumber(MagicNumber);
    Print("Codex-Test initialized.");
    return(INIT_SUCCEEDED);
@@ -112,6 +120,9 @@ void OnTick()
 
    g_last_atr_value = GetATRValue();
    ManageOpenPosition();
+
+   if(is_new_bar)
+      UpdateCompressionState(pdh, pdl);
 
    const double buffer = BreakBufferPoints * _Point;
    const int pdh_state = RelationToLevel(bid, pdh, buffer);
@@ -188,6 +199,47 @@ void ProcessAlerts(const double bid,
                              _Symbol, EnumToString(_Period), pdl, bid));
 }
 
+void UpdateCompressionState(const double pdh, const double pdl)
+{
+   if(g_last_atr_value <= 0.0)
+      return;
+
+   CompressionDetectionConfig config;
+   config.lookback_bars = CompressionLookbackBars;
+   config.level_tolerance_atr = CompressionToleranceATR;
+   config.max_cluster_range_atr = CompressionRangeATR;
+   config.max_body_size_atr = CompressionBodyATR;
+   config.confirmation_bars = CompressionExpiryBars;
+
+   AgeCompressionState(g_compression_state);
+
+   const bool pdh_compression = DetectCompressionAtLevel(_Symbol,
+                                                         PERIOD_CURRENT,
+                                                         pdh,
+                                                         g_last_atr_value,
+                                                         2,
+                                                         config);
+   const bool pdl_compression = DetectCompressionAtLevel(_Symbol,
+                                                         PERIOD_CURRENT,
+                                                         pdl,
+                                                         g_last_atr_value,
+                                                         2,
+                                                         config);
+   const datetime detected_bar = iTime(_Symbol, PERIOD_CURRENT, 1);
+
+   if(pdh_compression)
+   {
+      ActivatePDHCompression(g_compression_state, config.confirmation_bars, detected_bar);
+      PrintFormat("Codex-Test: PDH compression detected on %s %s.", _Symbol, EnumToString(_Period));
+   }
+
+   if(pdl_compression)
+   {
+      ActivatePDLCompression(g_compression_state, config.confirmation_bars, detected_bar);
+      PrintFormat("Codex-Test: PDL compression detected on %s %s.", _Symbol, EnumToString(_Period));
+   }
+}
+
 void EvaluateSignalBar(const double pdh, const double pdl, const double buffer)
 {
    const datetime signal_bar_time = iTime(_Symbol, PERIOD_CURRENT, 1);
@@ -199,10 +251,22 @@ void EvaluateSignalBar(const double pdh, const double pdl, const double buffer)
    const double high1  = iHigh(_Symbol, PERIOD_CURRENT, 1);
    const double low1   = iLow(_Symbol, PERIOD_CURRENT, 1);
 
-   const bool buy_break  = (open1 <= pdh + buffer && close1 > pdh + buffer);
-   const bool sell_break = (open1 >= pdl - buffer && close1 < pdl - buffer);
+   const bool buy_break  = (g_compression_state.pdh_active &&
+                            open1 <= pdh + buffer &&
+                            close1 > pdh + buffer);
+   const bool sell_break = (g_compression_state.pdl_active &&
+                            open1 >= pdl - buffer &&
+                            close1 < pdl - buffer);
+   const bool sell_sweep = (g_compression_state.pdh_active &&
+                            high1 > pdh + buffer &&
+                            close1 < pdh - buffer &&
+                            close1 < open1);
+   const bool buy_sweep  = (g_compression_state.pdl_active &&
+                            low1 < pdl - buffer &&
+                            close1 > pdl + buffer &&
+                            close1 > open1);
 
-   if(!buy_break && !sell_break)
+   if(!buy_break && !sell_break && !buy_sweep && !sell_sweep)
       return;
 
    g_last_signal_bar = signal_bar_time;
@@ -211,8 +275,9 @@ void EvaluateSignalBar(const double pdh, const double pdl, const double buffer)
    {
       g_buy_signals++;
       CreateSignalMarker(signal_bar_time, low1, true);
-      FireAlert(StringFormat("BUY signal on %s %s. Bar close %.5f broke PDH %.5f",
+      FireAlert(StringFormat("BUY breakout after PDH compression on %s %s. Close %.5f above PDH %.5f",
                              _Symbol, EnumToString(_Period), close1, pdh));
+      ConsumePDHCompression(g_compression_state);
       if(CanTradeInTester())
          ExecuteTrade(ORDER_TYPE_BUY);
    }
@@ -221,8 +286,31 @@ void EvaluateSignalBar(const double pdh, const double pdl, const double buffer)
    {
       g_sell_signals++;
       CreateSignalMarker(signal_bar_time, high1, false);
-      FireAlert(StringFormat("SELL signal on %s %s. Bar close %.5f broke PDL %.5f",
+      FireAlert(StringFormat("SELL breakout after PDL compression on %s %s. Close %.5f below PDL %.5f",
                              _Symbol, EnumToString(_Period), close1, pdl));
+      ConsumePDLCompression(g_compression_state);
+      if(CanTradeInTester())
+         ExecuteTrade(ORDER_TYPE_SELL);
+   }
+
+   if(buy_sweep)
+   {
+      g_buy_signals++;
+      CreateSignalMarker(signal_bar_time, low1, true);
+      FireAlert(StringFormat("BUY sweep-reclaim after PDL compression on %s %s. Low %.5f reclaimed PDL %.5f",
+                             _Symbol, EnumToString(_Period), low1, pdl));
+      ConsumePDLCompression(g_compression_state);
+      if(CanTradeInTester())
+         ExecuteTrade(ORDER_TYPE_BUY);
+   }
+
+   if(sell_sweep)
+   {
+      g_sell_signals++;
+      CreateSignalMarker(signal_bar_time, high1, false);
+      FireAlert(StringFormat("SELL sweep-reject after PDH compression on %s %s. High %.5f rejected PDH %.5f",
+                             _Symbol, EnumToString(_Period), high1, pdh));
+      ConsumePDHCompression(g_compression_state);
       if(CanTradeInTester())
          ExecuteTrade(ORDER_TYPE_SELL);
    }
@@ -420,6 +508,9 @@ void ShowStatus(const double bid,
    status += StringFormat("Bid: %.5f\n", bid);
    status += StringFormat("PDH: %.5f  PDL: %.5f\n", pdh, pdl);
    status += StringFormat("ATR(%d): %.5f\n", ATRPeriod, g_last_atr_value);
+   status += StringFormat("Compression PDH/PDL: %s/%s\n",
+                          (g_compression_state.pdh_active ? "Ready" : "Idle"),
+                          (g_compression_state.pdl_active ? "Ready" : "Idle"));
 
    if(mid > 0.0)
       status += StringFormat("Mid: %.5f\n", mid);
