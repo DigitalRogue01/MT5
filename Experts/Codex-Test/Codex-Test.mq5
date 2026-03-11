@@ -1,10 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                                    Codex-Test.mq5 |
-//| Test EA for "Previouse Day High and Low"                         |
+//| Tester-only PDH/PDL breakout EA                                  |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.00"
-#property description "Test EA that attaches the Previous Day High/Low indicator and reads its chart objects."
+#property version   "1.10"
+#property description "Loads the Previous Day High/Low indicator, marks PDH/PDL breakout signals, and can place tester-only trades."
+
+#include <Trade/Trade.mqh>
 
 input string IndicatorName            = "DigitalRogue\\Previouse Day High and Low";
 input bool   AttachIndicatorToChart   = true;
@@ -12,6 +14,11 @@ input bool   ShowChartComment         = true;
 input bool   EnablePopupAlerts        = true;
 input bool   AlertOnNewBarOnly        = true;
 input double BreakBufferPoints        = 5.0;
+input bool   EnableTesterTrades       = true;
+input double FixedLotSize             = 0.10;
+input double RiskRewardRatio          = 1.50;
+input ulong  MagicNumber              = 260311;
+input bool   DrawSignalMarkers        = true;
 
 string PDH_Line   = "PDH_LINE";
 string PDL_Line   = "PDL_LINE";
@@ -20,12 +27,19 @@ string QLO_Line   = "QLO_LINE";
 string QHI_Line   = "QHI_LINE";
 string DOPEN_Line = "DOPEN_LINE";
 string WOPEN_Line = "WOPEN_LINE";
+string SignalPrefix = "CODEX_SIGNAL_";
 
 int      g_indicator_handle = INVALID_HANDLE;
 datetime g_last_bar_time    = 0;
 int      g_last_pdh_state   = 0;
 int      g_last_pdl_state   = 0;
 bool     g_states_ready     = false;
+datetime g_last_signal_bar  = 0;
+int      g_buy_signals      = 0;
+int      g_sell_signals     = 0;
+int      g_trade_count      = 0;
+
+CTrade trade;
 
 int OnInit()
 {
@@ -39,6 +53,7 @@ int OnInit()
    if(AttachIndicatorToChart && !ChartIndicatorAdd(0, 0, g_indicator_handle))
       PrintFormat("Codex-Test: indicator loaded but ChartIndicatorAdd failed. Error=%d", GetLastError());
 
+   trade.SetExpertMagicNumber(MagicNumber);
    Print("Codex-Test initialized.");
    return(INIT_SUCCEEDED);
 }
@@ -88,17 +103,17 @@ void OnTick()
       g_last_pdl_state = pdl_state;
       g_states_ready = true;
    }
-   else if(!AlertOnNewBarOnly || is_new_bar)
-   {
-      ProcessAlerts(bid, pdh, pdl, pdh_state, pdl_state);
-      g_last_pdh_state = pdh_state;
-      g_last_pdl_state = pdl_state;
-   }
    else
    {
+      if(!AlertOnNewBarOnly || is_new_bar)
+         ProcessAlerts(bid, pdh, pdl, pdh_state, pdl_state);
+
       g_last_pdh_state = pdh_state;
       g_last_pdl_state = pdl_state;
    }
+
+   if(is_new_bar)
+      EvaluateSignalBar(pdh, pdl, buffer);
 
    if(ShowChartComment)
       ShowStatus(bid, pdh, pdl, mid, qlo, qhi, dopen, wopen, pdh_state, pdl_state);
@@ -139,6 +154,127 @@ void ProcessAlerts(const double bid,
    if(g_last_pdl_state >= 0 && pdl_state == -1)
       FireAlert(StringFormat("%s %s broke below PDL at %.5f (Bid %.5f)",
                              _Symbol, EnumToString(_Period), pdl, bid));
+}
+
+void EvaluateSignalBar(const double pdh, const double pdl, const double buffer)
+{
+   const datetime signal_bar_time = iTime(_Symbol, PERIOD_CURRENT, 1);
+   if(signal_bar_time == 0 || signal_bar_time == g_last_signal_bar)
+      return;
+
+   const double open1  = iOpen(_Symbol, PERIOD_CURRENT, 1);
+   const double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+   const double high1  = iHigh(_Symbol, PERIOD_CURRENT, 1);
+   const double low1   = iLow(_Symbol, PERIOD_CURRENT, 1);
+
+   const bool buy_break  = (open1 <= pdh + buffer && close1 > pdh + buffer);
+   const bool sell_break = (open1 >= pdl - buffer && close1 < pdl - buffer);
+
+   if(!buy_break && !sell_break)
+      return;
+
+   g_last_signal_bar = signal_bar_time;
+
+   if(buy_break)
+   {
+      g_buy_signals++;
+      CreateSignalMarker(signal_bar_time, low1, true);
+      FireAlert(StringFormat("BUY signal on %s %s. Bar close %.5f broke PDH %.5f",
+                             _Symbol, EnumToString(_Period), close1, pdh));
+      if(CanTradeInTester())
+         ExecuteTrade(ORDER_TYPE_BUY, pdh, pdl);
+   }
+
+   if(sell_break)
+   {
+      g_sell_signals++;
+      CreateSignalMarker(signal_bar_time, high1, false);
+      FireAlert(StringFormat("SELL signal on %s %s. Bar close %.5f broke PDL %.5f",
+                             _Symbol, EnumToString(_Period), close1, pdl));
+      if(CanTradeInTester())
+         ExecuteTrade(ORDER_TYPE_SELL, pdh, pdl);
+   }
+}
+
+bool CanTradeInTester()
+{
+   return(EnableTesterTrades && MQLInfoInteger(MQL_TESTER) != 0);
+}
+
+void ExecuteTrade(const ENUM_ORDER_TYPE order_type,
+                  const double pdh,
+                  const double pdl)
+{
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick))
+      return;
+
+   if(PositionSelect(_Symbol))
+   {
+      ENUM_POSITION_TYPE current_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      if((order_type == ORDER_TYPE_BUY  && current_type == POSITION_TYPE_BUY) ||
+         (order_type == ORDER_TYPE_SELL && current_type == POSITION_TYPE_SELL))
+         return;
+
+      if(!trade.PositionClose(_Symbol))
+      {
+         PrintFormat("Codex-Test: failed to close opposite position. Error=%d", GetLastError());
+         return;
+      }
+   }
+
+   double entry = (order_type == ORDER_TYPE_BUY ? tick.ask : tick.bid);
+   double sl = 0.0;
+   double tp = 0.0;
+
+   if(order_type == ORDER_TYPE_BUY)
+   {
+      sl = NormalizeDouble(pdl, _Digits);
+      if(sl <= 0.0 || sl >= entry)
+      {
+         Print("Codex-Test: skipped BUY trade because stop loss is invalid.");
+         return;
+      }
+      tp = NormalizeDouble(entry + ((entry - sl) * RiskRewardRatio), _Digits);
+      if(trade.Buy(FixedLotSize, _Symbol, 0.0, sl, tp, "Codex-Test BUY"))
+         g_trade_count++;
+      else
+         PrintFormat("Codex-Test: BUY failed. Error=%d", GetLastError());
+   }
+   else if(order_type == ORDER_TYPE_SELL)
+   {
+      sl = NormalizeDouble(pdh, _Digits);
+      if(sl <= entry)
+      {
+         Print("Codex-Test: skipped SELL trade because stop loss is invalid.");
+         return;
+      }
+      tp = NormalizeDouble(entry - ((sl - entry) * RiskRewardRatio), _Digits);
+      if(trade.Sell(FixedLotSize, _Symbol, 0.0, sl, tp, "Codex-Test SELL"))
+         g_trade_count++;
+      else
+         PrintFormat("Codex-Test: SELL failed. Error=%d", GetLastError());
+   }
+}
+
+void CreateSignalMarker(const datetime bar_time,
+                        const double price,
+                        const bool is_buy)
+{
+   if(!DrawSignalMarkers)
+      return;
+
+   string name = SignalPrefix + IntegerToString((int)bar_time) + (is_buy ? "_BUY" : "_SELL");
+   if(ObjectFind(0, name) >= 0)
+      return;
+
+   if(!ObjectCreate(0, name, OBJ_ARROW, 0, bar_time, price))
+      return;
+
+   ObjectSetInteger(0, name, OBJPROP_ARROWCODE, (is_buy ? 241 : 242));
+   ObjectSetInteger(0, name, OBJPROP_COLOR, (is_buy ? clrLime : clrTomato));
+   ObjectSetInteger(0, name, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, (is_buy ? ANCHOR_BOTTOM : ANCHOR_TOP));
 }
 
 void FireAlert(const string message)
@@ -190,6 +326,7 @@ void ShowStatus(const double bid,
                 const int pdl_state)
 {
    string status = "Codex-Test\n";
+   status += StringFormat("Mode: %s\n", (CanTradeInTester() ? "Tester trading enabled" : "Signals only"));
    status += StringFormat("Symbol: %s  TF: %s\n", _Symbol, EnumToString(_Period));
    status += StringFormat("Bid: %.5f\n", bid);
    status += StringFormat("PDH: %.5f  PDL: %.5f\n", pdh, pdl);
@@ -204,9 +341,13 @@ void ShowStatus(const double bid,
       status += StringFormat("Weekly Open: %.5f\n", wopen);
 
    status += StringFormat("Zone: %s\n", DescribeZone(bid, pdh, pdl, mid, qlo, qhi));
-   status += StringFormat("PDH State: %s  PDL State: %s",
+   status += StringFormat("PDH State: %s  PDL State: %s\n",
                           StateLabel(pdh_state),
                           StateLabel(pdl_state));
+   status += StringFormat("Signals Buy/Sell: %d/%d  Trades: %d",
+                          g_buy_signals,
+                          g_sell_signals,
+                          g_trade_count);
 
    Comment(status);
 }
@@ -219,4 +360,3 @@ string StateLabel(const int state)
       return("Below");
    return("Near");
 }
-
