@@ -1,16 +1,20 @@
 ﻿# MT5
 
-This repo contains local MetaTrader 5 projects and test harnesses, with an emphasis on structured market levels, indicator-driven workflows, and AI-assisted trading experiments.
+This repo contains MetaTrader 5 projects and test harnesses organized in an MT5-style layout.
 
-## Current layout
+## Layout
 
-- `Codex-Test.mq5`
-  A test EA that loads the `Previouse Day High and Low` indicator, reads its chart objects, and reports breakout state without placing trades.
-- `MACD_Trinity/MACD_Trinity.mq5`
-  The current active MACD Trinity EA source.
-- `MACD_Trinity/versions/`
-  Archived historical versions kept for reference while Git history remains the primary record.
+- `Experts/Codex-Test/Codex-Test.mq5`
+  Test EA that loads the `Previouse Day High and Low` indicator, reads its chart objects, and reports breakout state without placing live trades.
+- `Experts/MACD_Trinity/MACD_Trinity.mq5`
+  Current active MACD Trinity EA source.
+- `Experts/MACD_Trinity/versions/`
+  Archived EA snapshots kept for reference.
+- `Indicators/Previouse Day High and Low.mq5`
+  Tracked copy of the previous-day levels indicator used by `Codex-Test`.
+- `Scripts/`
+  Reserved for future MT5 helper scripts.
 
-## Direction
+## Notes
 
-The broader project vision is an MT5 trading system that can extract structured market context from MetaTrader 5, package it into deterministic payloads, and hand that context to an external AI decision engine for analysis, bias, and trade guidance.
+The Git repo itself lives inside the local `MQL5\\Experts` tree, so the repo's `Indicators` folder is the tracked project copy, not the global terminal indicator folder. For local MT5 use, the indicator should also exist under the terminal's real `MQL5\\Indicators` path.

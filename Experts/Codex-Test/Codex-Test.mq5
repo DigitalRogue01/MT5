@@ -6,7 +6,7 @@
 #property version   "1.00"
 #property description "Test EA that attaches the Previous Day High/Low indicator and reads its chart objects."
 
-input string IndicatorName            = "Previouse Day High and Low";
+input string IndicatorName            = "DigitalRogue\\Previouse Day High and Low";
 input bool   AttachIndicatorToChart   = true;
 input bool   ShowChartComment         = true;
 input bool   EnablePopupAlerts        = true;
@@ -219,3 +219,4 @@ string StateLabel(const int state)
       return("Below");
    return("Near");
 }
+
