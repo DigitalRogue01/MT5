@@ -1,0 +1,5 @@
+*.py text eol=lf
+*.mq5 text eol=crlf
+*.mqh text eol=crlf
+*.md text eol=lf
+*.onnx binary
